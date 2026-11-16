@@ -38,13 +38,15 @@ add_custom_command(
 # Core cross-platform sources
 set(SOURCES
     src/main.cpp
+    src/crypto/gen_certs.cpp
     "${EMBEDDED_WEB_CPP}"
 )
 
 add_executable(${PROJECT_NAME} ${SOURCES})
 target_include_directories(${PROJECT_NAME} PRIVATE src)
 
-target_link_libraries(${PROJECT_NAME} PRIVATE ixwebsocket)
+find_package(OpenSSL REQUIRED)
+target_link_libraries(${PROJECT_NAME} PRIVATE ixwebsocket OpenSSL::Crypto)
 
 if(UNIX AND NOT APPLE)
     target_compile_definitions(${PROJECT_NAME} PRIVATE PLATFORM_LINUX)

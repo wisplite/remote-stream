@@ -2,6 +2,7 @@
 #include <thread>
 #include <chrono>
 #include "capture/factory.hpp"
+#include "crypto/gen_certs.hpp"
 #include "web/embedded_assets.hpp"
 #include <ixwebsocket/IXHttpServer.h>
 #include <ixwebsocket/IXNetSystem.h>
@@ -11,9 +12,11 @@ int main() {
 
     ix::HttpServer server(7200, "0.0.0.0");
 
+    auto tls_certs = ensure_tls_certs();
     ix::SocketTLSOptions tlsOptions;
-    tlsOptions.certFile = "cert.pem";
-    tlsOptions.keyFile = "key.pem";
+    tlsOptions.tls = true;
+    tlsOptions.certFile = tls_certs.cert_path.string();
+    tlsOptions.keyFile = tls_certs.key_path.string();
     tlsOptions.caFile = "NONE";
     server.setTLSOptions(tlsOptions);
 
