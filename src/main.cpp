@@ -2,6 +2,7 @@
 #include <thread>
 #include <chrono>
 #include "capture/factory.hpp"
+#include "input/factory.hpp"
 #include "crypto/gen_certs.hpp"
 #include "web/embedded_assets.hpp"
 #include <ixwebsocket/IXHttpServer.h>
@@ -48,15 +49,42 @@ int main() {
 
     // Set by connection threads, consumed by the capture thread
     std::atomic<bool> full_frame_requested{false};
+    
+    auto input_injector = create_input_injector();
+    if (!input_injector || !input_injector->init(":1")) {
+        std::cerr << "Failed to initialize input injector\n";
+        return 1;
+    }
 
-    server.setOnClientMessageCallback([&full_frame_requested](std::shared_ptr<ix::ConnectionState> state, ix::WebSocket& ws, const ix::WebSocketMessagePtr& msg) {
+    server.setOnClientMessageCallback([&full_frame_requested, &input_injector](std::shared_ptr<ix::ConnectionState> state, ix::WebSocket& ws, const ix::WebSocketMessagePtr& msg) {
         if (msg->type == ix::WebSocketMessageType::Open) {
             std::cout << "Client connected: " << state->getRemoteIp() << std::endl;
             full_frame_requested = true;
         } else if (msg->type == ix::WebSocketMessageType::Close) {
             std::cout << "Client disconnected: " << state->getRemoteIp() << std::endl;
         } else if (msg->type == ix::WebSocketMessageType::Message) {
-            std::cout << "Client sent message: " << msg->str << std::endl;
+            if (!msg->binary || msg->str.empty()) return;
+
+            const auto* view = reinterpret_cast<const uint8_t*>(msg->str.data());
+            const size_t len = msg->str.size();
+            const uint8_t type = view[0];
+            if (type == 0x10 && len >= 5) {
+                const uint16_t x = view[1] | (view[2] << 8);
+                const uint16_t y = view[3] | (view[4] << 8);
+                input_injector->move_mouse(x, y);
+            } else if (type == 0x11 && len >= 3) {
+                const uint8_t button = view[1];
+                const bool pressed = view[2] != 0;
+                input_injector->mouse_button(static_cast<MouseButton>(button), pressed);
+            } else if (type == 0x12 && len >= 3) {
+                const int8_t delta_x = view[1];
+                const int8_t delta_y = view[2];
+                input_injector->scroll(delta_x, delta_y);
+            } else if (type == 0x13 && len >= 6) {
+                const uint32_t key = view[1] | (view[2] << 8) | (view[3] << 16) | (view[4] << 24);
+                const bool pressed = view[5] != 0;
+                input_injector->key_event(key, pressed);
+            }
         }
     });
 

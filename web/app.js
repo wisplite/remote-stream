@@ -57,3 +57,79 @@ ws.onmessage = (event) => {
       .catch((err) => console.error("Failed to draw tile", err));
   }
 };
+
+// Input handling
+function getRemoteCoords(event) {
+    const rect = canvas.getBoundingClientRect();
+    const scaleX = canvas.width / rect.width;
+    const scaleY = canvas.height / rect.height;
+    return {
+        x: Math.round((event.clientX - rect.left) * scaleX),
+        y: Math.round((event.clientY - rect.top) * scaleY),
+    };
+}
+
+function sendKey(keysym, pressed) {
+    // send key is 0x13, uint32 keysym, uint8 pressed
+    const view = new DataView(new ArrayBuffer(8));
+    view.setUint8(0, 0x13);
+    view.setUint32(1, keysym, true);
+    view.setUint8(5, pressed ? 1 : 0);
+    ws.send(view.buffer);
+}
+
+function moveMouse(x, y, button, pressed) {
+    // mouse move is 0x10, uint16 x, uint16 y
+    const view = new DataView(new ArrayBuffer(6));
+    view.setUint8(0, 0x10);
+    view.setUint16(1, x, true);
+    view.setUint16(3, y, true);
+    ws.send(view.buffer);
+}
+
+function pressMouseButton(button, pressed) {
+    // mouse button is 0x11, uint8 button, uint8 pressed
+    const view = new DataView(new ArrayBuffer(4));
+    view.setUint8(0, 0x11);
+    view.setUint8(1, button + 1);
+    view.setUint8(2, pressed ? 1 : 0);
+    ws.send(view.buffer);
+}
+
+function scrollMouse(delta_x, delta_y) {
+    // mouse scroll is 0x12, int8 delta_x, int8 delta_y
+    const view = new DataView(new ArrayBuffer(4));
+    view.setUint8(0, 0x12);
+    view.setInt8(1, delta_x);
+    view.setInt8(2, delta_y);
+    ws.send(view.buffer);
+}
+
+canvas.tabIndex = 0;
+canvas.addEventListener("contextmenu", (event) => event.preventDefault());
+canvas.addEventListener("keydown", (event) => {
+    event.preventDefault();
+    const keysym = eventToKeysym(event);
+    if (keysym) sendKey(keysym, true);
+});
+canvas.addEventListener("keyup", (event) => {
+    event.preventDefault();
+    const keysym = eventToKeysym(event);
+    if (keysym) sendKey(keysym, false);
+});
+canvas.addEventListener("mousemove", (event) => {
+    const { x, y } = getRemoteCoords(event);
+    moveMouse(x, y);
+});
+canvas.addEventListener("mousedown", (event) => {
+    const { button } = event;
+    pressMouseButton(button, true);
+});
+canvas.addEventListener("mouseup", (event) => {
+    const { button } = event;
+    pressMouseButton(button, false);
+});
+canvas.addEventListener("wheel", (event) => {
+    const { deltaX, deltaY } = event;
+    scrollMouse(deltaX, deltaY);
+});

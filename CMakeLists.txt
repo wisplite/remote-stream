@@ -132,6 +132,8 @@ if(UNIX AND NOT APPLE)
         xcb-damage 
         xcb-shm 
         xcb-xfixes
+        xcb-xtest
+        xcb-keysyms
     )
     
     target_sources(${PROJECT_NAME} PRIVATE 
