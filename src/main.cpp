@@ -6,6 +6,9 @@
 #include "web/embedded_assets.hpp"
 #include <ixwebsocket/IXHttpServer.h>
 #include <ixwebsocket/IXNetSystem.h>
+#include <codec/tile/tile_encoder.hpp>
+#include <codec/tile/webp_encoder.cpp>
+#include <capture/rect_utils.hpp>
 
 int main() {
     ix::initNetSystem();
@@ -52,26 +55,51 @@ int main() {
     }
 
     server.start();
-    server.wait();
 
-    /*auto capture = create_tile_source();
-    if (!capture || !capture->init(":1")) {
-        std::cerr << "Failed to initialize capture source\n";
-        return 1;
-    }
-
-    std::cout << "Listening for damage events...\n";
-    RawFrameDelta delta;
-
-    while (true) {
-        if (capture->poll_delta(delta)) {
-            std::cout << "Frame update: " << delta.dirty_rects.size() << " dirty rect(s)\n";
-            for (const auto& r : delta.dirty_rects) {
-                std::cout << "  -> [" << r.x << ", " << r.y << " " << r.width << "x" << r.height << "]\n";
-            }
+    // start tile damage capture
+    std::jthread capture_thread([&](std::stop_token stoken) {
+        auto capture = create_tile_source();
+        if (!capture || !capture->init(":1")) {
+            std::cerr << "Failed to initialize capture source\n";
+            return 1;
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(16)); // ~60Hz poll
-    }*/
+
+        std::cout << "Listening for damage events...\n";
+        auto encoder = std::make_unique<WebpTileEncoder>(75);
+        RawFrameDelta delta;
+
+        while (true) {
+            if (capture->poll_delta(delta)) {
+                RectUtils::merge_dirty_rects(delta.dirty_rects);
+                for (const auto& r : delta.dirty_rects) {
+                    EncodedTile tile;
+                    if (encoder->encode(delta, r, tile)) {
+                        for (const auto& client : server.getClients()) {
+                            if (client->getReadyState() == ix::ReadyState::Open) {
+                                auto write_u16_le = [](std::vector<uint8_t>& buf, uint16_t val) {
+                                    buf.push_back(static_cast<uint8_t>(val & 0xFF));
+                                    buf.push_back(static_cast<uint8_t>((val >> 8) & 0xFF));
+                                };
+
+                                std::vector<uint8_t> packet;
+                                packet.reserve(9 + tile.payload.size());
+                                packet.push_back(static_cast<uint8_t>(tile.codec));
+                                write_u16_le(packet, static_cast<uint16_t>(tile.bounds.x));
+                                write_u16_le(packet, static_cast<uint16_t>(tile.bounds.y));
+                                write_u16_le(packet, static_cast<uint16_t>(tile.bounds.width));
+                                write_u16_le(packet, static_cast<uint16_t>(tile.bounds.height));
+                                packet.insert(packet.end(), tile.payload.begin(), tile.payload.end());
+                                client->sendBinary(packet);
+                            }
+                        }
+                    }
+                }
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(16)); // ~60Hz poll
+        }
+    });
+
+    server.wait();
 
     return 0;
 }
