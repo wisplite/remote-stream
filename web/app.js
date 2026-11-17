@@ -4,6 +4,7 @@ const ctx = canvas.getContext("2d", { alpha: false });
 // First byte of every message; must match MessageType in src/main.cpp
 const MSG_SCREEN_INFO = 1;
 const MSG_TILE = 2;
+const MSG_CURSOR = 3;
 
 const MIME_TYPES = {
   1: "image/webp",
@@ -17,8 +18,70 @@ function fitCanvas() {
   const scale = Math.min(window.innerWidth / canvas.width, window.innerHeight / canvas.height);
   canvas.style.width = `${Math.floor(canvas.width * scale)}px`;
   canvas.style.height = `${Math.floor(canvas.height * scale)}px`;
+  applyCursor();
 }
 window.addEventListener("resize", fitCanvas);
+
+// Host cursor, drawn by the browser as a CSS cursor so it tracks the local pointer
+// with no round-trip latency. Re-rendered on resize to match the canvas scale.
+let hostCursor = null; // { image: HTMLCanvasElement, xhot, yhot } | { hidden: true }
+const MAX_CSS_CURSOR = 128; // Browsers ignore larger cursor images
+
+function setHostCursor(view, buffer) {
+  const w = view.getUint16(1, true);
+  const h = view.getUint16(3, true);
+  const xhot = view.getUint16(5, true);
+  const yhot = view.getUint16(7, true);
+  const pixels = new Uint8ClampedArray(buffer, 9, w * h * 4);
+
+  let visible = false;
+  for (let i = 3; i < pixels.length; i += 4) {
+    if (pixels[i] !== 0) { visible = true; break; }
+  }
+  if (!visible || w === 0 || h === 0) {
+    hostCursor = { hidden: true };
+  } else {
+    const image = document.createElement("canvas");
+    image.width = w;
+    image.height = h;
+    image.getContext("2d").putImageData(new ImageData(pixels.slice(), w, h), 0, 0);
+    hostCursor = { image, xhot, yhot };
+  }
+  applyCursor();
+}
+
+function applyCursor() {
+  if (!hostCursor) {
+    canvas.style.cursor = "";
+    return;
+  }
+  if (hostCursor.hidden) {
+    canvas.style.cursor = "none";
+    return;
+  }
+
+  const { image, xhot, yhot } = hostCursor;
+  const rectWidth = canvas.getBoundingClientRect().width;
+  // Canvas is hidden until the first ScreenInfo arrives, so its rendered width
+  // is 0; wait until it is visible rather than scaling the cursor down to 1x1.
+  if (!rectWidth || !canvas.width) return;
+  const displayScale = rectWidth / canvas.width;
+  const scale = Math.min(displayScale, MAX_CSS_CURSOR / image.width, MAX_CSS_CURSOR / image.height);
+  const w = Math.max(1, Math.round(image.width * scale));
+  const h = Math.max(1, Math.round(image.height * scale));
+
+  const scaled = document.createElement("canvas");
+  scaled.width = w;
+  scaled.height = h;
+  const sctx = scaled.getContext("2d");
+  sctx.imageSmoothingQuality = "high";
+  sctx.drawImage(image, 0, 0, w, h);
+
+  // The hotspot must lie inside the image or the browser rejects the cursor
+  const hx = Math.min(w - 1, Math.round(xhot * scale));
+  const hy = Math.min(h - 1, Math.round(yhot * scale));
+  canvas.style.cursor = `url(${scaled.toDataURL("image/png")}) ${hx} ${hy}, auto`;
+}
 
 // Decodes run in parallel, but results are applied strictly in arrival order
 let applyQueue = Promise.resolve();
@@ -34,13 +97,18 @@ ws.onmessage = (event) => {
     const w = view.getUint16(1, true);
     const h = view.getUint16(3, true);
     applyQueue = applyQueue.then(() => {
+      const wasHidden = canvas.hidden;
+      canvas.hidden = false;
       if (canvas.width !== w || canvas.height !== h) {
         canvas.width = w;
         canvas.height = h;
         fitCanvas();
+      } else if (wasHidden) {
+        fitCanvas();
       }
-      canvas.hidden = false;
     });
+  } else if (type === MSG_CURSOR) {
+    setHostCursor(view, event.data);
   } else if (type === MSG_TILE) {
     const mime = MIME_TYPES[view.getUint8(1)];
     if (!mime) return;
@@ -56,6 +124,11 @@ ws.onmessage = (event) => {
       })
       .catch((err) => console.error("Failed to draw tile", err));
   }
+};
+
+ws.onclose = () => {
+  hostCursor = null;
+  applyCursor();
 };
 
 // Input handling

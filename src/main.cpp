@@ -17,6 +17,7 @@
 enum class MessageType : uint8_t {
     ScreenInfo = 1, // u16 width, u16 height (LE); always precedes a full frame
     Tile = 2,       // u8 codec, u16 x, y, width, height (LE), then encoded image
+    Cursor = 3,     // u16 width, height, xhot, yhot (LE), then width*height straight RGBA
 };
 
 int main() {
@@ -104,6 +105,14 @@ int main() {
             return 1;
         }
 
+        // Optional: without it the client keeps showing its own local cursor
+        auto cursor = create_cursor_source();
+        if (cursor && !cursor->init(":1")) {
+            std::cerr << "Cursor capture unavailable; clients will use their local cursor\n";
+            cursor.reset();
+        }
+        CursorImage cursor_img;
+
         std::cout << "Listening for damage events...\n";
         auto encoder = std::make_unique<JpegTileEncoder>(75);
         RawFrameDelta delta;
@@ -123,6 +132,20 @@ int main() {
         while (!stoken.stop_requested()) {
             if (full_frame_requested.exchange(false)) {
                 capture->request_full_frame();
+                // New clients need the current shape, not just the next change
+                if (cursor) cursor->request_full_update();
+            }
+
+            if (cursor && cursor->poll_cursor(cursor_img)) {
+                std::vector<uint8_t> packet;
+                packet.reserve(9 + cursor_img.rgba.size());
+                packet.push_back(static_cast<uint8_t>(MessageType::Cursor));
+                write_u16_le(packet, static_cast<uint16_t>(cursor_img.width));
+                write_u16_le(packet, static_cast<uint16_t>(cursor_img.height));
+                write_u16_le(packet, static_cast<uint16_t>(cursor_img.xhot));
+                write_u16_le(packet, static_cast<uint16_t>(cursor_img.yhot));
+                packet.insert(packet.end(), cursor_img.rgba.begin(), cursor_img.rgba.end());
+                broadcast(packet);
             }
 
             if (capture->poll_delta(delta)) {

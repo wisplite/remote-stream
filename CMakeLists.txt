@@ -138,6 +138,7 @@ if(UNIX AND NOT APPLE)
     
     target_sources(${PROJECT_NAME} PRIVATE 
         src/capture/linux/x11_tile_source.cpp
+        src/capture/linux/x11_cursor_source.cpp
     )
     target_link_libraries(${PROJECT_NAME} PRIVATE PkgConfig::XCB)
 
