@@ -12,12 +12,14 @@
 #include <codec/tile/jpeg_encoder.cpp>
 #include <capture/rect_utils.hpp>
 #include <atomic>
-
+#include "audio/factory.hpp"
+#include "audio/opus_encoder.hpp"
 // First byte of every binary WebSocket message; must match web/app.js
 enum class MessageType : uint8_t {
     ScreenInfo = 1, // u16 width, u16 height (LE); always precedes a full frame
     Tile = 2,       // u8 codec, u16 x, y, width, height (LE), then encoded image
     Cursor = 3,     // u16 width, height, xhot, yhot (LE), then width*height straight RGBA
+    Audio = 4,      // u8 channels, u32 sample_rate, then float samples (interleaved)
 };
 
 int main() {
@@ -124,7 +126,9 @@ int main() {
         auto broadcast = [&](const std::vector<uint8_t>& packet) {
             for (const auto& client : server.getClients()) {
                 if (client->getReadyState() == ix::ReadyState::Open) {
-                    client->sendBinary(packet);
+                    if (client->bufferedAmount() < 131072) { // pause frame data to avoid audio dropouts when client is busy
+                        client->sendBinary(packet);
+                    }
                 }
             }
         };
@@ -178,6 +182,54 @@ int main() {
                 }
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(16)); // ~60Hz poll
+        }
+        return 0;
+    });
+
+    // start audio capture
+    std::jthread audio_thread([&](std::stop_token stoken) {
+        auto audio = create_audio_source();
+        auto encoder = std::make_unique<OpusAudioEncoder>();
+        if (!audio || !audio->init(AudioConfig{48000, 2, 960})) {
+            std::cerr << "Failed to initialize audio source\n";
+            return 1;
+        }
+        if (!encoder || !encoder->init(48000, 2, 128000)) {
+            std::cerr << "Failed to initialize audio encoder\n";
+            return 1;
+        }
+
+        std::vector<float> pcm_interleaved;
+        std::vector<uint8_t> opus_packet;
+        while (!stoken.stop_requested()) {
+            if (server.getClients().empty()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                continue;
+            }
+
+            if (audio->read_chunk(pcm_interleaved)) {
+                auto write_u32_le = [](std::vector<uint8_t>& buf, uint32_t val) {
+                    buf.push_back(static_cast<uint8_t>(val & 0xFF));
+                    buf.push_back(static_cast<uint8_t>((val >> 8) & 0xFF));
+                    buf.push_back(static_cast<uint8_t>((val >> 16) & 0xFF));
+                    buf.push_back(static_cast<uint8_t>((val >> 24) & 0xFF));
+                };
+                std::vector<uint8_t> packet;
+                if (encoder->encode(pcm_interleaved, opus_packet)) {
+                    const size_t payload_bytes = opus_packet.size();
+                    packet.reserve(6 + payload_bytes);
+                    packet.push_back(static_cast<uint8_t>(MessageType::Audio));
+                    packet.push_back(static_cast<uint8_t>(audio->config().channels));
+                    write_u32_le(packet, audio->config().sample_rate);
+                    const auto* raw_bytes = reinterpret_cast<const uint8_t*>(opus_packet.data());
+                    packet.insert(packet.end(), raw_bytes, raw_bytes + payload_bytes);
+                    for (const auto& client : server.getClients()) {
+                        if (client->getReadyState() == ix::ReadyState::Open) {
+                            client->sendBinary(packet);
+                        }
+                    }
+                }
+            }
         }
         return 0;
     });

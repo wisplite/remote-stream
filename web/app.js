@@ -5,6 +5,7 @@ const ctx = canvas.getContext("2d", { alpha: false });
 const MSG_SCREEN_INFO = 1;
 const MSG_TILE = 2;
 const MSG_CURSOR = 3;
+const MSG_AUDIO = 4;
 
 const MIME_TYPES = {
   1: "image/webp",
@@ -123,6 +124,16 @@ ws.onmessage = (event) => {
         bitmap.close(); // Immediately free the GPU/decoded texture memory
       })
       .catch((err) => console.error("Failed to draw tile", err));
+  } else if (type === MSG_AUDIO) {
+    if (!audioNode || !audioDecoder || audioDecoder.state !== "configured") return;
+    // Header: u8 type (1) + u8 channels (1) + u32 sample_rate (4) = 6 bytes
+    const opusPayload = event.data.slice(6);
+    audioDecoder.decode(new EncodedAudioChunk({
+      type: "key",
+      timestamp: audioTimestampUs,
+      data: opusPayload,
+    }));
+    audioTimestampUs += 20000;
   }
 };
 
@@ -206,3 +217,59 @@ canvas.addEventListener("wheel", (event) => {
     const { deltaX, deltaY } = event;
     scrollMouse(deltaX, deltaY);
 });
+
+// Audio handling
+let audioNode = null;
+let audioDecoder = null;
+let audioTimestampUs = 0;
+
+function initOpusDecoder() {
+  if (audioDecoder) return;
+  audioDecoder = new AudioDecoder({
+    output: (audioData) => {
+      const frames = audioData.numberOfFrames;
+      const left = new Float32Array(frames);
+      const right = new Float32Array(frames);
+
+      audioData.copyTo(left, { planeIndex: 0, format: "f32-planar" });
+      audioData.copyTo(right, { planeIndex: 1, format: "f32-planar" });
+      audioData.close();
+
+      const interleaved = new Float32Array(frames * 2);
+      for (let i = 0; i < frames; i++) {
+        interleaved[i * 2] = left[i];
+        interleaved[i * 2 + 1] = right[i];
+      }
+
+      if (audioNode) {
+        audioNode.port.postMessage(interleaved.buffer, [interleaved.buffer]);
+      }
+    },
+    error: (error) => {
+      console.error("Audio decoder error", error);
+    },
+  });
+
+  audioDecoder.configure({
+    codec: "opus",
+    sampleRate: 48000,
+    numberOfChannels: 2,
+  });
+}
+
+async function initAudio() {
+  if (audioNode) return;
+  const audioCtx = new AudioContext({ sampleRate: 48000 });
+  if (audioCtx.state === "suspended") {
+    await audioCtx.resume();
+  }
+  await audioCtx.audioWorklet.addModule("audio-worklet.js");
+  audioNode = new AudioWorkletNode(audioCtx, "pcm-ring-processor", {
+    outputChannelCount: [2],
+  });
+  audioNode.connect(audioCtx.destination);
+}
+
+canvas.addEventListener("mousedown", () => {
+  initAudio().then(() => initOpusDecoder());
+}, { once: true });

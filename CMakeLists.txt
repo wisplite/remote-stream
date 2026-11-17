@@ -134,6 +134,8 @@ if(UNIX AND NOT APPLE)
         xcb-xfixes
         xcb-xtest
         xcb-keysyms
+        libpulse-simple
+        opus
     )
     
     target_sources(${PROJECT_NAME} PRIVATE 
