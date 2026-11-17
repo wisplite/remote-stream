@@ -87,60 +87,165 @@ function applyCursor() {
 // Decodes run in parallel, but results are applied strictly in arrival order
 let applyQueue = Promise.resolve();
 
-const ws = new WebSocket(`wss://${location.host}/`);
-ws.binaryType = "arraybuffer";
+const overlay = document.getElementById("overlay");
+const overlayTitle = document.getElementById("overlay-title");
+const overlaySubtitle = document.getElementById("overlay-subtitle");
+const reconnectBtn = document.getElementById("reconnect-btn");
 
-ws.onmessage = (event) => {
-  const view = new DataView(event.data);
-  const type = view.getUint8(0);
+let ws = null;
+let reconnectTimer = null;
+let countdownTimer = null;
+let reconnectAttempts = 0;
+const BASE_RECONNECT_MS = 1000;
+const MAX_RECONNECT_MS = 15000;
 
-  if (type === MSG_SCREEN_INFO) {
-    const w = view.getUint16(1, true);
-    const h = view.getUint16(3, true);
-    applyQueue = applyQueue.then(() => {
-      const wasHidden = canvas.hidden;
-      canvas.hidden = false;
-      if (canvas.width !== w || canvas.height !== h) {
-        canvas.width = w;
-        canvas.height = h;
-        fitCanvas();
-      } else if (wasHidden) {
-        fitCanvas();
-      }
-    });
-  } else if (type === MSG_CURSOR) {
-    setHostCursor(view, event.data);
-  } else if (type === MSG_TILE) {
-    const mime = MIME_TYPES[view.getUint8(1)];
-    if (!mime) return;
-    const x = view.getUint16(2, true);
-    const y = view.getUint16(4, true);
-
-    const decoded = createImageBitmap(new Blob([event.data.slice(10)], { type: mime }));
-    applyQueue = applyQueue
-      .then(() => decoded)
-      .then((bitmap) => {
-        ctx.drawImage(bitmap, x, y);
-        bitmap.close(); // Immediately free the GPU/decoded texture memory
-      })
-      .catch((err) => console.error("Failed to draw tile", err));
-  } else if (type === MSG_AUDIO) {
-    if (!audioNode || !audioDecoder || audioDecoder.state !== "configured") return;
-    // Header: u8 type (1) + u8 channels (1) + u32 sample_rate (4) = 6 bytes
-    const opusPayload = event.data.slice(6);
-    audioDecoder.decode(new EncodedAudioChunk({
-      type: "key",
-      timestamp: audioTimestampUs,
-      data: opusPayload,
-    }));
-    audioTimestampUs += 20000;
+function clearReconnectTimers() {
+  if (reconnectTimer !== null) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
   }
-};
+  if (countdownTimer !== null) {
+    clearInterval(countdownTimer);
+    countdownTimer = null;
+  }
+}
 
-ws.onclose = () => {
-  hostCursor = null;
-  applyCursor();
-};
+function showOverlay(title, subtitle = "", showRetry = false) {
+  overlayTitle.textContent = title;
+  overlaySubtitle.textContent = subtitle;
+  reconnectBtn.hidden = !showRetry;
+  overlay.hidden = false;
+}
+
+function hideOverlay() {
+  overlay.hidden = true;
+}
+
+function scheduleReconnect() {
+  clearReconnectTimers();
+  const delayMs = Math.min(BASE_RECONNECT_MS * Math.pow(2, reconnectAttempts), MAX_RECONNECT_MS);
+  reconnectAttempts++;
+
+  let remainingSec = Math.ceil(delayMs / 1000);
+  const updateSubtitle = () => {
+    overlaySubtitle.textContent = `Reconnecting in ${remainingSec}s...`;
+  };
+
+  showOverlay("Connection lost", "", true);
+  updateSubtitle();
+
+  countdownTimer = setInterval(() => {
+    remainingSec = Math.max(0, remainingSec - 1);
+    if (remainingSec > 0) {
+      updateSubtitle();
+    } else {
+      clearInterval(countdownTimer);
+      countdownTimer = null;
+    }
+  }, 1000);
+
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    connect();
+  }, delayMs);
+}
+
+function connect() {
+  clearReconnectTimers();
+  if (ws) {
+    const prev = ws;
+    ws = null;
+    prev.close();
+  }
+
+  showOverlay("Connecting...", reconnectAttempts > 0 ? "Attempting to reconnect..." : "");
+  const socket = new WebSocket(`wss://${location.host}/`);
+  socket.binaryType = "arraybuffer";
+  ws = socket;
+
+  socket.onopen = () => {
+    if (socket !== ws) return;
+    reconnectAttempts = 0;
+    clearReconnectTimers();
+    hideOverlay();
+  };
+
+  socket.onmessage = (event) => {
+    if (socket !== ws) return;
+    const view = new DataView(event.data);
+    const type = view.getUint8(0);
+
+    if (type === MSG_SCREEN_INFO) {
+      const w = view.getUint16(1, true);
+      const h = view.getUint16(3, true);
+      applyQueue = applyQueue.then(() => {
+        const wasHidden = canvas.hidden;
+        canvas.hidden = false;
+        if (canvas.width !== w || canvas.height !== h) {
+          canvas.width = w;
+          canvas.height = h;
+          fitCanvas();
+        } else if (wasHidden) {
+          fitCanvas();
+        }
+      });
+    } else if (type === MSG_CURSOR) {
+      setHostCursor(view, event.data);
+    } else if (type === MSG_TILE) {
+      const mime = MIME_TYPES[view.getUint8(1)];
+      if (!mime) return;
+      const x = view.getUint16(2, true);
+      const y = view.getUint16(4, true);
+
+      const decoded = createImageBitmap(new Blob([event.data.slice(10)], { type: mime }));
+      applyQueue = applyQueue
+        .then(() => decoded)
+        .then((bitmap) => {
+          ctx.drawImage(bitmap, x, y);
+          bitmap.close(); // Immediately free the GPU/decoded texture memory
+        })
+        .catch((err) => console.error("Failed to draw tile", err));
+    } else if (type === MSG_AUDIO) {
+      if (!audioNode || !audioDecoder || audioDecoder.state !== "configured") return;
+      // Header: u8 type (1) + u8 channels (1) + u32 sample_rate (4) = 6 bytes
+      const opusPayload = event.data.slice(6);
+      audioDecoder.decode(new EncodedAudioChunk({
+        type: "key",
+        timestamp: audioTimestampUs,
+        data: opusPayload,
+      }));
+      audioTimestampUs += 20000;
+    }
+  };
+
+  socket.onclose = () => {
+    if (socket !== ws) return;
+    ws = null;
+    hostCursor = null;
+    applyCursor();
+    scheduleReconnect();
+  };
+}
+
+reconnectBtn.addEventListener("click", () => {
+  reconnectAttempts = 0;
+  connect();
+});
+
+window.addEventListener("online", () => {
+  if (!ws || ws.readyState === WebSocket.CLOSED) {
+    reconnectAttempts = 0;
+    connect();
+  }
+});
+
+connect();
+
+function sendMessage(buffer) {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(buffer);
+  }
+}
 
 // Input handling
 function getRemoteCoords(event) {
@@ -159,7 +264,7 @@ function sendKey(keysym, pressed) {
     view.setUint8(0, 0x13);
     view.setUint32(1, keysym, true);
     view.setUint8(5, pressed ? 1 : 0);
-    ws.send(view.buffer);
+    sendMessage(view.buffer);
 }
 
 function moveMouse(x, y, button, pressed) {
@@ -168,7 +273,7 @@ function moveMouse(x, y, button, pressed) {
     view.setUint8(0, 0x10);
     view.setUint16(1, x, true);
     view.setUint16(3, y, true);
-    ws.send(view.buffer);
+    sendMessage(view.buffer);
 }
 
 function pressMouseButton(button, pressed) {
@@ -177,7 +282,7 @@ function pressMouseButton(button, pressed) {
     view.setUint8(0, 0x11);
     view.setUint8(1, button + 1);
     view.setUint8(2, pressed ? 1 : 0);
-    ws.send(view.buffer);
+    sendMessage(view.buffer);
 }
 
 function scrollMouse(delta_x, delta_y) {
@@ -186,7 +291,7 @@ function scrollMouse(delta_x, delta_y) {
     view.setUint8(0, 0x12);
     view.setInt8(1, delta_x);
     view.setInt8(2, delta_y);
-    ws.send(view.buffer);
+    sendMessage(view.buffer);
 }
 
 canvas.tabIndex = 0;
