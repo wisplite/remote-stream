@@ -19,6 +19,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config \
     libpulse-dev \
     libopus-dev \
+    libyuv-dev \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src

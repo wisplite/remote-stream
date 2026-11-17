@@ -121,6 +121,8 @@ bool X11TileSource::poll_delta(RawFrameDelta& out_delta) {
     }
 
     if (new_width != width_ || new_height != height_) {
+        // The caller may still hold the old buffer from an earlier delta
+        out_delta.bgra_buffer = nullptr;
         free_shm();
         width_ = new_width;
         height_ = new_height;

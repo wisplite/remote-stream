@@ -7,7 +7,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON) # Generates compile_commands.json for clan
 
 include(FetchContent)
 
-option(STATIC_BUILD "Statically link OpenSSL, WebP, libjpeg-turbo, and C++ runtime" OFF)
+option(STATIC_BUILD "Statically link OpenSSL, WebP, libjpeg-turbo, x264, and C++ runtime" OFF)
 
 if(STATIC_BUILD)
     set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
@@ -102,6 +102,33 @@ if(STATIC_BUILD)
     )
     add_dependencies(turbojpeg_static libjpeg_turbo_ep)
 
+    set(X264_PREFIX "${CMAKE_CURRENT_BINARY_DIR}/_deps/x264")
+    ExternalProject_Add(
+        x264_ep
+        GIT_REPOSITORY https://code.videolan.org/videolan/x264.git
+        GIT_TAG stable
+        GIT_SHALLOW TRUE
+        PREFIX "${X264_PREFIX}"
+        CONFIGURE_COMMAND <SOURCE_DIR>/configure
+            --prefix=${X264_PREFIX}/install
+            --enable-static
+            --disable-cli
+            --enable-pic
+            --disable-opencl
+        BUILD_COMMAND sh -c "make -j$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)"
+        INSTALL_COMMAND make install
+        BUILD_BYPRODUCTS "${X264_PREFIX}/install/lib/libx264.a"
+    )
+    file(MAKE_DIRECTORY "${X264_PREFIX}/install/include")
+    find_package(Threads REQUIRED)
+    add_library(x264_static STATIC IMPORTED)
+    set_target_properties(x264_static PROPERTIES
+        IMPORTED_LOCATION "${X264_PREFIX}/install/lib/libx264.a"
+        INTERFACE_INCLUDE_DIRECTORIES "${X264_PREFIX}/install/include"
+        INTERFACE_LINK_LIBRARIES "Threads::Threads;$<$<PLATFORM_ID:Linux,Darwin,FreeBSD>:m>;${CMAKE_DL_LIBS}"
+    )
+    add_dependencies(x264_static x264_ep)
+
     target_include_directories(${PROJECT_NAME} PRIVATE
         "${libwebp_SOURCE_DIR}/src"
     )
@@ -111,15 +138,19 @@ if(STATIC_BUILD)
         OpenSSL::SSL
         webp
         turbojpeg_static
+        x264_static
     )
 else()
     find_package(WebP REQUIRED)
     find_package(libjpeg-turbo REQUIRED)
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(X264 REQUIRED IMPORTED_TARGET x264)
     target_link_libraries(${PROJECT_NAME} PRIVATE
         ixwebsocket
         OpenSSL::Crypto
         WebP::webp
         libjpeg-turbo::turbojpeg
+        PkgConfig::X264
     )
 endif()
 
@@ -137,12 +168,16 @@ if(UNIX AND NOT APPLE)
         libpulse-simple
         opus
     )
+
+    find_path(LIBYUV_INCLUDE_DIR NAMES libyuv.h REQUIRED)
+    find_library(LIBYUV_LIBRARY NAMES yuv REQUIRED)
     
     target_sources(${PROJECT_NAME} PRIVATE 
         src/capture/linux/x11_tile_source.cpp
         src/capture/linux/x11_cursor_source.cpp
     )
-    target_link_libraries(${PROJECT_NAME} PRIVATE PkgConfig::XCB)
+    target_include_directories(${PROJECT_NAME} PRIVATE ${LIBYUV_INCLUDE_DIR})
+    target_link_libraries(${PROJECT_NAME} PRIVATE PkgConfig::XCB ${LIBYUV_LIBRARY})
 
     if(STATIC_BUILD)
         target_link_options(${PROJECT_NAME} PRIVATE -static-libstdc++ -static-libgcc)

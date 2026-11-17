@@ -11,6 +11,9 @@ struct Rect {
 };
 
 struct RawFrameDelta {
+    // Always the full display. Stays valid (holding the last captured frame) across
+    // poll_delta calls that return false; the source resets it to nullptr itself
+    // before the memory goes away (e.g. on resize), so reuse the same delta object.
     const uint8_t* bgra_buffer = nullptr;
     int width = 0;
     int height = 0;

@@ -6,6 +6,14 @@ const MSG_SCREEN_INFO = 1;
 const MSG_TILE = 2;
 const MSG_CURSOR = 3;
 const MSG_AUDIO = 4;
+const MSG_H264_VIDEO = 5;
+const MSG_PING = 6;
+const MSG_STREAM_MODE = 7;
+
+// Client -> server message types; must match ClientMessage in src/main.cpp
+const CMSG_PONG = 0x20;
+const CMSG_KEYFRAME_REQUEST = 0x21;
+const CMSG_H264_UNSUPPORTED = 0x22;
 
 const MIME_TYPES = {
   1: "image/webp",
@@ -150,6 +158,110 @@ function scheduleReconnect() {
   }, delayMs);
 }
 
+// H.264 tier. Every connection starts on tiles; the server switches a viewer to
+// H.264 with a StreamMode message once its link proves stable, and back again
+// (followed by a full tile frame) when the link degrades.
+const STREAM_TILES = 0;
+const STREAM_H264 = 1;
+// Matches what x264 emits with the ultrafast preset (Constrained Baseline, level 5.2)
+const H264_CODEC = "avc1.42e034";
+const KEYFRAME_REQUEST_INTERVAL_MS = 500;
+
+let streamMode = STREAM_TILES;
+let videoDecoder = null;
+let videoGeneration = 0; // bumped on every decoder reset so stale frames are dropped
+let waitingForKeyframe = true;
+let lastKeyframeRequestMs = -Infinity;
+let screenWidth = 0;
+let screenHeight = 0;
+
+// Resolves once per page; the server keeps us on tiles if this is false
+const h264Supported = (async () => {
+  if (typeof VideoDecoder === "undefined") return false;
+  try {
+    const { supported } = await VideoDecoder.isConfigSupported({ codec: H264_CODEC, optimizeForLatency: true });
+    return !!supported;
+  } catch {
+    return false;
+  }
+})();
+
+function requestKeyframe() {
+  const now = performance.now();
+  if (now - lastKeyframeRequestMs < KEYFRAME_REQUEST_INTERVAL_MS) return;
+  lastKeyframeRequestMs = now;
+  sendMessage(new Uint8Array([CMSG_KEYFRAME_REQUEST]).buffer);
+}
+
+function closeH264Decoder() {
+  videoGeneration++;
+  if (videoDecoder && videoDecoder.state !== "closed") videoDecoder.close();
+  videoDecoder = null;
+  waitingForKeyframe = true;
+}
+
+function initH264Decoder() {
+  closeH264Decoder();
+  const generation = videoGeneration;
+  videoDecoder = new VideoDecoder({
+    output: (frame) => {
+      // Chained so a frame can't be overdrawn by tiles that arrived before the switch,
+      // and dropped if the decoder was reset (e.g. we fell back to tiles) meanwhile
+      applyQueue = applyQueue.then(() => {
+        if (generation === videoGeneration) ctx.drawImage(frame, 0, 0);
+        frame.close();
+      });
+    },
+    error: (error) => {
+      console.error("Video decoder error", error);
+      if (generation !== videoGeneration) return;
+      // The decoder is closed now; the next chunk recreates it and waits for an IDR
+      closeH264Decoder();
+      requestKeyframe();
+    },
+  });
+  videoDecoder.configure({
+    codec: H264_CODEC,
+    optimizeForLatency: true,
+  });
+}
+
+function setStreamMode(mode) {
+  if (mode === streamMode) return;
+  streamMode = mode;
+  if (mode === STREAM_H264) {
+    initH264Decoder();
+  } else {
+    closeH264Decoder();
+  }
+}
+
+function decodeH264(view, buffer) {
+  if (streamMode !== STREAM_H264) return;
+  const isKeyframe = view.getUint8(1) !== 0;
+  if (!videoDecoder) initH264Decoder();
+
+  if (waitingForKeyframe) {
+    if (!isKeyframe) {
+      requestKeyframe();
+      return;
+    }
+    waitingForKeyframe = false;
+  }
+  // Skipping a delta frame would corrupt every frame after it, so resync from an IDR
+  if (!isKeyframe && videoDecoder.decodeQueueSize > 3) {
+    waitingForKeyframe = true;
+    requestKeyframe();
+    return;
+  }
+
+  videoDecoder.decode(new EncodedVideoChunk({
+    type: isKeyframe ? "key" : "delta",
+    timestamp: Number(view.getBigUint64(2, true)),
+    data: new Uint8Array(buffer, 10),
+  }));
+}
+
 function connect() {
   clearReconnectTimers();
   if (ws) {
@@ -157,6 +269,10 @@ function connect() {
     ws = null;
     prev.close();
   }
+
+  // Every connection starts on tiles
+  streamMode = STREAM_TILES;
+  closeH264Decoder();
 
   showOverlay("Connecting...", reconnectAttempts > 0 ? "Attempting to reconnect..." : "");
   const socket = new WebSocket(`wss://${location.host}/`);
@@ -168,6 +284,9 @@ function connect() {
     reconnectAttempts = 0;
     clearReconnectTimers();
     hideOverlay();
+    h264Supported.then((supported) => {
+      if (!supported && socket === ws) socket.send(new Uint8Array([CMSG_H264_UNSUPPORTED]).buffer);
+    });
   };
 
   socket.onmessage = (event) => {
@@ -175,9 +294,28 @@ function connect() {
     const view = new DataView(event.data);
     const type = view.getUint8(0);
 
-    if (type === MSG_SCREEN_INFO) {
+    if (type === MSG_PING) {
+      // Echo immediately; the server derives RTT jitter from these to pick our tier
+      const pong = new Uint8Array(5);
+      pong[0] = CMSG_PONG;
+      pong.set(new Uint8Array(event.data, 1, 4), 1);
+      sendMessage(pong.buffer);
+    } else if (type === MSG_STREAM_MODE) {
+      setStreamMode(view.getUint8(1));
+      if (streamMode === STREAM_H264) {
+        console.log("Switching to H.264");
+      } else {
+        console.log("Switching to tiles");
+      }
+    } else if (type === MSG_SCREEN_INFO) {
       const w = view.getUint16(1, true);
       const h = view.getUint16(3, true);
+      if ((w !== screenWidth || h !== screenHeight) && streamMode === STREAM_H264) {
+        // The server restarts its encoder on resize; start clean from that IDR
+        initH264Decoder();
+      }
+      screenWidth = w;
+      screenHeight = h;
       applyQueue = applyQueue.then(() => {
         const wasHidden = canvas.hidden;
         canvas.hidden = false;
@@ -215,6 +353,8 @@ function connect() {
         data: opusPayload,
       }));
       audioTimestampUs += 20000;
+    } else if (type === MSG_H264_VIDEO) {
+      decodeH264(view, event.data);
     }
   };
 
@@ -222,6 +362,8 @@ function connect() {
     if (socket !== ws) return;
     ws = null;
     hostCursor = null;
+    streamMode = STREAM_TILES;
+    closeH264Decoder();
     applyCursor();
     scheduleReconnect();
   };
