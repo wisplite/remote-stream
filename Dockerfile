@@ -9,6 +9,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     libssl-dev \
     libxcb-damage0-dev \
+    libxcb-dpms0-dev \
     libxcb-keysyms1-dev \
     libxcb-shm0-dev \
     libxcb-xfixes0-dev \

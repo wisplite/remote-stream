@@ -161,6 +161,7 @@ if(UNIX AND NOT APPLE)
     pkg_check_modules(XCB REQUIRED IMPORTED_TARGET 
         xcb 
         xcb-damage 
+        xcb-dpms
         xcb-shm 
         xcb-xfixes
         xcb-xtest

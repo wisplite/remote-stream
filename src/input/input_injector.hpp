@@ -20,4 +20,7 @@ public:
     virtual void scroll(int delta_x, int delta_y) = 0;
 
     virtual void key_event(uint32_t key, bool pressed) = 0;
+
+    // Bring the display out of power saving so the compositor paints at full rate
+    virtual void wake_display() {}
 };

@@ -462,6 +462,7 @@ int main() {
             // so other viewers don't get a redundant full-screen refresh
             viewers.add(&ws, std::make_shared<Viewer>(state->getRemoteIp()));
             cursor_refresh_requested = true;
+            input_injector->wake_display();
         } else if (msg->type == ix::WebSocketMessageType::Close) {
             std::cout << "Client disconnected: " << state->getRemoteIp() << std::endl;
             viewers.remove(&ws);
