@@ -163,8 +163,8 @@ function scheduleReconnect() {
 // (followed by a full tile frame) when the link degrades.
 const STREAM_TILES = 0;
 const STREAM_H264 = 1;
-// Matches what x264 emits with the ultrafast preset (Constrained Baseline, level 5.2)
-const H264_CODEC = "avc1.42e034";
+// Matches what x264 emits with the superfast preset
+const H264_CODEC = "avc1.4d0034";
 const KEYFRAME_REQUEST_INTERVAL_MS = 500;
 
 let streamMode = STREAM_TILES;
@@ -193,8 +193,91 @@ function requestKeyframe() {
   sendMessage(new Uint8Array([CMSG_KEYFRAME_REQUEST]).buffer);
 }
 
+// ---- H.264 presentation ----
+// Decoded frames aren't drawn as soon as they come out of the decoder: network and
+// decode jitter would bunch them up, so two can land within one refresh (one is
+// never seen, the neighbour is held twice as long). Instead each frame is given a
+// playout time from its capture timestamp, and a requestAnimationFrame loop shows
+// at most one frame per display refresh, the newest one that is due.
+//
+// playout = capture time + clock offset + jitter delay, where the offset is the
+// smallest (arrival - capture) seen recently, i.e. the fastest a frame has made it
+// here, and the delay is a small adaptive margin covering how late frames usually are.
+const PLAYOUT_OFFSET_WINDOW_MS = 2000;
+const PLAYOUT_MAX_DELAY_MS = 50;
+const PRESENT_MAX_QUEUE = 8; // bounds memory while rAF is paused in a background tab
+
+let presentQueue = []; // { frame, playoutMs }, in decode order
+let presentRafId = 0;
+let offsetSamples = []; // { atMs, offsetMs }, ascending offsets (monotonic deque)
+let lateEwmaMs = 0;
+let refreshMs = 1000 / 60;
+let lastRafMs = 0;
+
+function resetPresentation() {
+  for (const entry of presentQueue) entry.frame.close();
+  presentQueue = [];
+  offsetSamples = [];
+  lateEwmaMs = 0;
+  if (presentRafId) cancelAnimationFrame(presentRafId);
+  presentRafId = 0;
+  lastRafMs = 0;
+}
+
+function enqueueVideoFrame(frame) {
+  const nowMs = performance.now();
+  const captureMs = frame.timestamp / 1000;
+  const offsetMs = nowMs - captureMs;
+
+  // Sliding-window minimum of the offset
+  while (offsetSamples.length && offsetSamples[offsetSamples.length - 1].offsetMs >= offsetMs) offsetSamples.pop();
+  offsetSamples.push({ atMs: nowMs, offsetMs });
+  while (offsetSamples[0].atMs < nowMs - PLAYOUT_OFFSET_WINDOW_MS) offsetSamples.shift();
+  const baseOffsetMs = offsetSamples[0].offsetMs;
+
+  // How late this frame is relative to the fastest recent one
+  lateEwmaMs += (offsetMs - baseOffsetMs - lateEwmaMs) / 16;
+  const delayMs = Math.min(lateEwmaMs * 2, PLAYOUT_MAX_DELAY_MS);
+
+  presentQueue.push({ frame, playoutMs: captureMs + baseOffsetMs + delayMs });
+  while (presentQueue.length > PRESENT_MAX_QUEUE) presentQueue.shift().frame.close();
+  if (!presentRafId) presentRafId = requestAnimationFrame(presentTick);
+}
+
+function presentTick(rafMs) {
+  presentRafId = 0;
+  if (lastRafMs) {
+    const dt = rafMs - lastRafMs;
+    // Ignore gaps from paused/idle loops when estimating the refresh interval
+    if (dt > 4 && dt < 50) refreshMs += (dt - refreshMs) / 8;
+  }
+  lastRafMs = rafMs;
+
+  // This frame is shown about one refresh from now; anything due by the middle
+  // of that interval may go on screen
+  const horizonMs = rafMs + refreshMs * 0.5;
+  let show = -1;
+  for (let i = 0; i < presentQueue.length; i++) {
+    if (presentQueue[i].playoutMs <= horizonMs) show = i;
+    else break;
+  }
+  if (show >= 0) {
+    // Older due frames were superseded within this refresh and are skipped
+    for (let i = 0; i < show; i++) presentQueue[i].frame.close();
+    const { frame } = presentQueue[show];
+    presentQueue = presentQueue.slice(show + 1);
+    ctx.drawImage(frame, 0, 0);
+    frame.close();
+  }
+
+  // Keeps ticking between frames (stopped by resetPresentation) so the refresh
+  // interval estimate stays accurate and a new frame never waits for a restart
+  presentRafId = requestAnimationFrame(presentTick);
+}
+
 function closeH264Decoder() {
   videoGeneration++;
+  resetPresentation();
   if (videoDecoder && videoDecoder.state !== "closed") videoDecoder.close();
   videoDecoder = null;
   waitingForKeyframe = true;
@@ -208,8 +291,8 @@ function initH264Decoder() {
       // Chained so a frame can't be overdrawn by tiles that arrived before the switch,
       // and dropped if the decoder was reset (e.g. we fell back to tiles) meanwhile
       applyQueue = applyQueue.then(() => {
-        if (generation === videoGeneration) ctx.drawImage(frame, 0, 0);
-        frame.close();
+        if (generation === videoGeneration) enqueueVideoFrame(frame);
+        else frame.close();
       });
     },
     error: (error) => {

@@ -69,6 +69,103 @@ namespace tier_policy {
     constexpr size_t kDowngradeBuffered = 64 * 1024;
     constexpr double kDowngradeJitterMs = 35.0;
     constexpr int64_t kDowngradeUnackedUs = 300'000;
+
+    // ---- Bandwidth override ----
+    // Tiles are effectively intra-only, so busy content (e.g. full-screen video)
+    // can saturate the link by itself. The resulting queueing shows up as jitter,
+    // which the rules above read as a bad link and so never leave tiles. When the
+    // tile stream sustains more than the H.264 stream would cost, H.264 is forced
+    // regardless of link telemetry, and stays forced until the screen goes quiet.
+    constexpr int kH264BitrateKbps = 6000;
+    constexpr double kFloodKbps = kH264BitrateKbps * 1.5;
+    constexpr int64_t kFloodRateWindowUs = 1'000'000; // rolling window for the tile rate
+    constexpr int64_t kFloodHoldUs = 5'000'000;       // rate must stay above kFloodKbps this long
+
+    // Leave forced H.264 when on average less than this share of the screen
+    // changes over kQuietWindowUs
+    constexpr double kQuietDirtyFraction = 0.15;
+    constexpr int64_t kQuietWindowUs = 5'000'000;
+    // Extra time the screen must stay quiet before leaving. Starts at zero and
+    // grows each time the override re-engages soon after releasing (kHoldResetUs),
+    // so content that floods tiles but looks quiet can't cycle the tiers.
+    constexpr int64_t kQuietHoldStepUs = 5'000'000;
+    constexpr int64_t kMaxQuietHoldUs = 40'000'000;
+
+    // While forced, a backed-up send buffer drops video frames (and resyncs with an
+    // IDR once drained) instead of downgrading. Large enough to absorb one IDR.
+    constexpr size_t kForcedDropBuffered = 256 * 1024;
+}
+
+// Screen activity measured by the capture thread and read by the control thread
+struct StreamActivity {
+    // Tile delta bytes encoded over the last kFloodRateWindowUs, as kbit/s. This is
+    // what the tile tier demands, independent of what congestion lets through.
+    std::atomic<double> tile_kbps{0.0};
+    // Time-weighted mean share of the screen dirtied per tick over kQuietWindowUs.
+    // Reads 1.0 (busy) until a full window has been observed.
+    std::atomic<double> dirty_fraction{1.0};
+};
+
+struct ActivitySnapshot {
+    double tile_kbps;
+    double dirty_fraction;
+};
+
+// Capture-thread-only rolling stats feeding StreamActivity
+class ActivityMonitor {
+public:
+    void record(int64_t now, double dirty_fraction, size_t tile_bytes) {
+        if (last_us_ == 0) {
+            last_us_ = now;
+            first_us_ = now;
+            return;
+        }
+        samples_.push_back({now, now - last_us_, dirty_fraction, tile_bytes});
+        last_us_ = now;
+        const int64_t keep_us = std::max(tier_policy::kQuietWindowUs, tier_policy::kFloodRateWindowUs);
+        while (!samples_.empty() && samples_.front().t_us <= now - keep_us) samples_.pop_front();
+    }
+
+    void publish(int64_t now, StreamActivity& out) const {
+        using namespace tier_policy;
+        size_t bytes = 0;
+        double dirty_weighted = 0.0;
+        int64_t dirty_span = 0;
+        for (const auto& s : samples_) {
+            if (s.t_us > now - kFloodRateWindowUs) bytes += s.tile_bytes;
+            if (s.t_us > now - kQuietWindowUs) {
+                dirty_weighted += s.dirty_fraction * s.dt_us;
+                dirty_span += s.dt_us;
+            }
+        }
+        out.tile_kbps = bytes * 8.0 / (kFloodRateWindowUs / 1000.0);
+        const bool window_full = first_us_ != 0 && now - first_us_ >= kQuietWindowUs;
+        out.dirty_fraction = (window_full && dirty_span > 0) ? dirty_weighted / dirty_span : 1.0;
+    }
+
+private:
+    struct Sample {
+        int64_t t_us;
+        int64_t dt_us;
+        double dirty_fraction;
+        size_t tile_bytes;
+    };
+    std::deque<Sample> samples_;
+    int64_t last_us_ = 0;
+    int64_t first_us_ = 0;
+};
+
+static double dirty_fraction_of(const RawFrameDelta& delta) {
+    const double screen = static_cast<double>(delta.width) * delta.height;
+    if (screen <= 0.0) return 0.0;
+    // Rects are merged before this, so overlaps are negligible
+    double area = 0.0;
+    for (const auto& r : delta.dirty_rects) {
+        const int x0 = std::max(r.x, 0), y0 = std::max(r.y, 0);
+        const int x1 = std::min(r.x + r.width, delta.width), y1 = std::min(r.y + r.height, delta.height);
+        if (x1 > x0 && y1 > y0) area += static_cast<double>(x1 - x0) * (y1 - y0);
+    }
+    return std::min(area / screen, 1.0);
 }
 
 // Tile data is skipped for a viewer above this, then resynced with a full frame
@@ -76,6 +173,9 @@ constexpr size_t kTileBufferGate = 128 * 1024;
 // x264 frames encoded from an unchanged screen after damage stops, so rate
 // control can refine the last (often blurry) frame of a burst
 constexpr int kH264TailFrames = 12;
+// Capture/encode tick rate. Ticks are scheduled on a fixed grid, so the time spent
+// capturing and encoding comes out of the interval instead of being added to it.
+constexpr int kCaptureFps = 60;
 
 static int64_t now_us() {
     using namespace std::chrono;
@@ -102,6 +202,14 @@ struct Viewer {
     bool want_h264 = false;
     bool h264_supported = true;
 
+    // Bandwidth override state (see tier_policy)
+    bool h264_forced = false;    // want_h264 came from the override; link telemetry is ignored
+    int64_t flood_since_us = 0;  // tiles have exceeded kFloodKbps continuously since then
+    int64_t forced_at_us = 0;
+    int64_t forced_exit_at_us = 0;
+    int64_t quiet_since_us = 0;
+    int64_t quiet_hold_us = 0;
+
     std::atomic<bool> keyframe_requested{false};
 
     // Owned by the capture thread, which is the only place tiers actually switch,
@@ -110,18 +218,29 @@ struct Viewer {
     bool awaiting_keyframe = false;
     bool needs_full_tiles = true; // new viewers start with a full-screen resync
 
-    bool wants_h264() {
+    struct TierRequest {
+        bool h264;
+        bool forced;
+    };
+    TierRequest tier_request() {
         std::lock_guard lock(mu);
-        return want_h264;
+        return {want_h264, h264_forced};
     }
 
-    void downgrade(int64_t now, const char* reason) {
+    // hard: H.264 cannot work at all (no decoder, no encoder), so this also
+    // cancels the bandwidth override. Otherwise a forced viewer stays on H.264.
+    void downgrade(int64_t now, const char* reason, bool hard = false) {
         std::lock_guard lock(mu);
-        downgrade_locked(now, reason);
+        downgrade_locked(now, reason, hard);
     }
 
-    void downgrade_locked(int64_t now, const char* reason) {
+    void downgrade_locked(int64_t now, const char* reason, bool hard = false) {
         if (!want_h264) return;
+        if (h264_forced) {
+            if (!hard) return;
+            h264_forced = false;
+            forced_exit_at_us = now;
+        }
         want_h264 = false;
         stable_since_us = 0;
         // Bouncing straight back out of H.264 suggests a marginal link; be slower to retry
@@ -137,7 +256,7 @@ struct Viewer {
     void mark_h264_unsupported(int64_t now) {
         std::lock_guard lock(mu);
         h264_supported = false;
-        downgrade_locked(now, "client cannot decode H.264");
+        downgrade_locked(now, "client cannot decode H.264", true);
     }
 
     uint32_t record_ping_sent(int64_t now) {
@@ -170,16 +289,42 @@ struct Viewer {
     }
 
     // Called by the control thread every ping interval
-    void evaluate_tier(size_t buffered, int64_t now) {
+    void evaluate_tier(size_t buffered, int64_t now, const ActivitySnapshot& activity) {
         using namespace tier_policy;
         std::lock_guard lock(mu);
         const int64_t unacked_us = pending_pings.empty() ? 0 : now - pending_pings.front().second;
 
         if (want_h264) {
+            flood_since_us = 0;
+            if (h264_forced) {
+                // Link telemetry is ignored here: congestion is expected to be caused
+                // by the content, and tiles would only make it worse
+                const bool quiet = now - forced_at_us >= kQuietWindowUs
+                    && activity.dirty_fraction < kQuietDirtyFraction;
+                if (!quiet) {
+                    quiet_since_us = 0;
+                } else if (quiet_since_us == 0) {
+                    quiet_since_us = now;
+                }
+                if (quiet && now - quiet_since_us >= quiet_hold_us) release_override_locked(now, activity);
+                return;
+            }
             if (buffered > kDowngradeBuffered) downgrade_locked(now, "send buffer backed up");
             else if (jitter_ms > kDowngradeJitterMs) downgrade_locked(now, "RTT jitter");
             else if (unacked_us > kDowngradeUnackedUs) downgrade_locked(now, "ping unacknowledged");
             return;
+        }
+
+        // Bandwidth override: checked before, and independently of, link health
+        if (h264_supported && activity.tile_kbps > kFloodKbps) {
+            if (flood_since_us == 0) {
+                flood_since_us = now;
+            } else if (now - flood_since_us >= kFloodHoldUs) {
+                engage_override_locked(now, activity);
+                return;
+            }
+        } else {
+            flood_since_us = 0;
         }
 
         const bool link_clean = h264_supported
@@ -200,6 +345,38 @@ struct Viewer {
                       << upgrade_hold_us / 1'000'000 << "s, jitter " << jitter_ms
                       << "ms, rtt " << avg_rtt_ms << "ms)\n";
         }
+    }
+
+private:
+    void engage_override_locked(int64_t now, const ActivitySnapshot& activity) {
+        using namespace tier_policy;
+        // Flooding again soon after the screen looked quiet: require a longer quiet spell next time
+        if (forced_exit_at_us != 0 && now - forced_exit_at_us < kHoldResetUs) {
+            quiet_hold_us = std::min(quiet_hold_us == 0 ? kQuietHoldStepUs : quiet_hold_us * 2, kMaxQuietHoldUs);
+        } else {
+            quiet_hold_us = 0;
+        }
+        want_h264 = true;
+        h264_forced = true;
+        forced_at_us = now;
+        upgraded_at_us = now;
+        flood_since_us = 0;
+        quiet_since_us = 0;
+        stable_since_us = 0;
+        std::cout << "Viewer " << remote_ip << ": tiles -> H.264 (bandwidth override: tiles at "
+                  << static_cast<int>(activity.tile_kbps) << "kbps for "
+                  << tier_policy::kFloodHoldUs / 1'000'000 << "s, jitter " << jitter_ms << "ms)\n";
+    }
+
+    void release_override_locked(int64_t now, const ActivitySnapshot& activity) {
+        // Not a link failure, so the network upgrade backoff is left alone
+        want_h264 = false;
+        h264_forced = false;
+        forced_exit_at_us = now;
+        quiet_since_us = 0;
+        stable_since_us = 0;
+        std::cout << "Viewer " << remote_ip << ": H.264 -> tiles (screen quiet, "
+                  << static_cast<int>(activity.dirty_fraction * 100.0) << "% dirty; leaving bandwidth override)\n";
     }
 };
 
@@ -269,6 +446,8 @@ int main() {
     ViewerRegistry viewers;
     // Set by connection threads, consumed by the capture thread
     std::atomic<bool> cursor_refresh_requested{false};
+    // Written by the capture thread, read by the control thread
+    StreamActivity activity;
 
     auto input_injector = create_input_injector();
     if (!input_injector || !input_injector->init(":1")) {
@@ -338,7 +517,8 @@ int main() {
                 if (!viewer) continue;
 
                 const int64_t now = now_us();
-                viewer->evaluate_tier(client->bufferedAmount(), now);
+                const ActivitySnapshot snapshot{activity.tile_kbps.load(), activity.dirty_fraction.load()};
+                viewer->evaluate_tier(client->bufferedAmount(), now, snapshot);
 
                 std::vector<uint8_t> packet;
                 packet.reserve(5);
@@ -376,11 +556,17 @@ int main() {
         bool idr_pending = false;
         int h264_tail_frames = 0;
         const int64_t epoch_us = now_us();
+        ActivityMonitor activity_monitor;
+        using tick_clock = std::chrono::steady_clock;
+        const auto tick_interval = std::chrono::duration_cast<tick_clock::duration>(
+            std::chrono::duration<double>(1.0 / kCaptureFps));
+        auto next_tick = tick_clock::now();
 
         struct Target {
             std::shared_ptr<ix::WebSocket> ws;
             std::shared_ptr<Viewer> viewer;
             bool skip_tile_deltas = false; // just resynced from the current buffer
+            bool forced_h264 = false;      // on H.264 via the bandwidth override
         };
         std::vector<Target> targets;
 
@@ -419,7 +605,8 @@ int main() {
             // Apply tier switches decided by the control thread
             for (auto& t : targets) {
                 Viewer& v = *t.viewer;
-                const bool want_h264 = v.wants_h264();
+                const auto [want_h264, forced] = v.tier_request();
+                t.forced_h264 = forced;
                 if (want_h264 && v.tier == StreamTier::Tiles) {
                     v.tier = StreamTier::H264;
                     v.awaiting_keyframe = true;
@@ -434,6 +621,11 @@ int main() {
                 }
                 if (v.keyframe_requested.exchange(false) && v.tier == StreamTier::H264) {
                     v.awaiting_keyframe = true;
+                    idr_pending = true;
+                }
+                // A forced viewer that had frames dropped resyncs once its buffer drains
+                if (v.tier == StreamTier::H264 && v.awaiting_keyframe
+                    && t.ws->bufferedAmount() <= tier_policy::kDowngradeBuffered) {
                     idr_pending = true;
                 }
             }
@@ -457,7 +649,14 @@ int main() {
             }
 
             const bool fresh = capture->poll_delta(delta);
+            // Stamped at capture, not after encoding, so encode time doesn't jitter the
+            // presentation timestamps the client paces playback with
+            const int64_t capture_us = now_us() - epoch_us;
             const bool have_frame = delta.bgra_buffer != nullptr;
+            // Resyncs aren't screen activity, so they don't count toward the override
+            const bool track_activity = fresh && !delta.full_frame;
+            size_t tile_delta_bytes = 0;
+            if (fresh) RectUtils::merge_dirty_rects(delta.dirty_rects);
 
             if (fresh && delta.full_frame) {
                 // Small and essential, so never gated
@@ -495,10 +694,10 @@ int main() {
                 }
 
                 if (fresh) {
-                    RectUtils::merge_dirty_rects(delta.dirty_rects);
                     for (const auto& r : delta.dirty_rects) {
                         EncodedTile tile;
                         if (!tile_encoder->encode(delta, r, tile)) continue;
+                        if (track_activity) tile_delta_bytes += tile.payload.size();
                         const auto packet = tile_packet(tile);
                         for (auto& t : targets) {
                             Viewer& v = *t.viewer;
@@ -527,11 +726,11 @@ int main() {
 
                 if (!video_encoder.matches(delta.width, delta.height)) {
                     // Also re-runs after a resize; a fresh encoder always starts with an IDR
-                    if (!video_encoder.init(delta.width, delta.height)) {
+                    if (!video_encoder.init(delta.width, delta.height, kCaptureFps, tier_policy::kH264BitrateKbps)) {
                         std::cerr << "Failed to initialize x264 encoder for "
                                   << delta.width << "x" << delta.height << "\n";
                         for (auto& t : targets) {
-                            if (t.viewer->tier == StreamTier::H264) t.viewer->downgrade(now_us(), "encoder unavailable");
+                            if (t.viewer->tier == StreamTier::H264) t.viewer->downgrade(now_us(), "encoder unavailable", true);
                         }
                     }
                 }
@@ -539,7 +738,7 @@ int main() {
                     if (idr_pending) video_encoder.request_keyframe();
 
                     EncodedVideoFrame frame;
-                    if (video_encoder.encode_bgra(delta.bgra_buffer, delta.stride, now_us() - epoch_us, frame)) {
+                    if (video_encoder.encode_bgra(delta.bgra_buffer, delta.stride, capture_us, frame)) {
                         if (frame.is_keyframe) idr_pending = false;
 
                         std::vector<uint8_t> packet;
@@ -554,10 +753,13 @@ int main() {
                             if (v.tier != StreamTier::H264) continue;
                             // Deltas are useless until the decoder has a keyframe to reference
                             if (v.awaiting_keyframe && !frame.is_keyframe) continue;
-                            if (t.ws->bufferedAmount() > tier_policy::kDowngradeBuffered) {
-                                // Dropping a frame would break the reference chain anyway;
-                                // fall back to tiles immediately rather than wait for the control tick
-                                v.downgrade(now_us(), "send buffer backed up");
+                            const size_t drop_above = t.forced_h264
+                                ? tier_policy::kForcedDropBuffered : tier_policy::kDowngradeBuffered;
+                            if (t.ws->bufferedAmount() > drop_above) {
+                                // Dropping a frame would break the reference chain anyway, so
+                                // fall back to tiles immediately rather than wait for the control
+                                // tick. Forced viewers stay put and resync with an IDR once drained.
+                                if (!t.forced_h264) v.downgrade(now_us(), "send buffer backed up");
                                 v.awaiting_keyframe = true;
                                 continue;
                             }
@@ -568,7 +770,22 @@ int main() {
                 }
             }
 
-            std::this_thread::sleep_for(std::chrono::milliseconds(16)); // ~60Hz poll
+            {
+                const int64_t now = now_us();
+                activity_monitor.record(now, track_activity ? dirty_fraction_of(delta) : 0.0, tile_delta_bytes);
+                activity_monitor.publish(now, activity);
+            }
+
+            // Fixed-grid pacing: sleep only for what's left of this tick. After an
+            // overrun, restart the grid from now rather than bursting to catch up.
+            next_tick += tick_interval;
+            const auto after_work = tick_clock::now();
+            if (next_tick <= after_work) {
+                next_tick = after_work;
+                std::this_thread::yield();
+            } else {
+                std::this_thread::sleep_until(next_tick);
+            }
         }
         return 0;
     });

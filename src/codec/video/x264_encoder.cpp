@@ -5,6 +5,7 @@
 #include <vector>
 #include <atomic>
 #include <cstring>
+#include <algorithm>
 
 struct EncodedVideoFrame {
     bool is_keyframe = false;
@@ -26,7 +27,7 @@ public:
         if (width_ <= 0 || height_ <= 0) return false;
         
         x264_param_t param;
-        if (x264_param_default_preset(&param, "ultrafast", "zerolatency") < 0) return false;
+        if (x264_param_default_preset(&param, "superfast", "zerolatency") < 0) return false;
 
         param.i_width = width_;
         param.i_height = height_;
@@ -37,15 +38,24 @@ public:
         // streaming settings
         param.i_threads = 4;
         param.b_sliced_threads = 1;
-        param.i_keyint_max = fps * 2;
+        // IDRs are already forced on demand (new viewers, decoder errors, dropped
+        // frames), so periodic ones only add a size spike every couple of seconds.
+        // Keep a long one as a safety net against silent decoder corruption.
+        param.i_keyint_max = fps * 10;
         param.b_intra_refresh = 0;
         param.b_repeat_headers = 1;
         param.b_annexb = 1;
 
-        param.rc.i_rc_method = X264_RC_ABR;
-        param.rc.i_bitrate = bitrate_kbps;
+        param.rc.i_rc_method = X264_RC_CRF;
+        param.rc.f_rf_constant = 23.0;
+        param.rc.i_bitrate = bitrate_kbps / 2;
         param.rc.i_vbv_max_bitrate = bitrate_kbps;
-        param.rc.i_vbv_buffer_size = bitrate_kbps / 2;
+        // The VBV buffer bounds how far a single frame can overshoot the per-frame
+        // budget. A 1s buffer let one frame (an IDR, a scroll) be several times the
+        // average, which then takes several frame intervals to send and shows up as a
+        // hitch. Cap it at a few frames' worth so frame sizes, and arrival times, stay even.
+        constexpr int kVbvFrames = 3;
+        param.rc.i_vbv_buffer_size = std::max(1, bitrate_kbps * kVbvFrames / fps);
         
         x264_param_apply_profile(&param, "main");
 
